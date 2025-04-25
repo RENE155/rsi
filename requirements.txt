@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+requests
+supabase
+pybit
+pandas
+numpy
+python-dotenv # For local development .env file loading 
