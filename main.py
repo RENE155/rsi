@@ -268,29 +268,46 @@ class RSIMonitor:
 
         # Clear previous subscriptions before starting new ones
         self.subscribed_symbols.clear()
-        subscription_args = [f"kline.{KLINE_INTERVAL}.{symbol}" for symbol in self.symbols]
+        # We still need the symbols list, but not the topic strings list
+        # subscription_args = [f"kline.{KLINE_INTERVAL}.{symbol}" for symbol in self.symbols]
 
         # Subscribe in batches to avoid potential issues with too many args at once
-        batch_size = 50
+        batch_size = 50 # Adjust batch size if needed, Bybit might have limits
         successfully_subscribed = set()
-        for i in range(0, len(subscription_args), batch_size):
-            batch = subscription_args[i:i+batch_size]
+        for i in range(0, len(self.symbols), batch_size):
+            # batch = subscription_args[i:i+batch_size]
+            batch_symbols = self.symbols[i:i+batch_size] # Get symbols for the current batch
+            logger.info(f"Attempting to subscribe symbols in batch {i//batch_size + 1}/{(len(self.symbols)+batch_size-1)//batch_size}...")
             try:
-                self.ws.subscribe(batch, callback=handle_message_wrapper)
-                # Extract symbols from the subscribed topics
-                for topic in batch:
-                    parts = topic.split('.')
-                    if len(parts) == 3:
-                        successfully_subscribed.add(parts[2])
-                logger.info(f"Subscribed to batch {i//batch_size + 1}/{(len(subscription_args)+batch_size-1)//batch_size}, {len(successfully_subscribed)} symbols total.")
-                time.sleep(1) # Small delay between batches
+                symbols_in_batch_subscribed = 0
+                for symbol in batch_symbols:
+                    # Use the specific kline_stream method for each symbol
+                    self.ws.kline_stream(
+                        symbol=symbol,
+                        interval=KLINE_INTERVAL,
+                        callback=handle_message_wrapper
+                    )
+                    # Assuming success if no immediate exception
+                    successfully_subscribed.add(symbol)
+                    symbols_in_batch_subscribed += 1
+                    # Optional: Add a very small delay between subscriptions within a batch if needed
+                    # time.sleep(0.02)
+
+                logger.info(f"Subscribed {symbols_in_batch_subscribed} symbols in batch {i//batch_size + 1}. Total subscribed: {len(successfully_subscribed)}.")
+                # Add a delay between sending batches of subscription requests
+                if i + batch_size < len(self.symbols):
+                     logger.info("Waiting 1 second before next batch...")
+                     time.sleep(1)
+
             except Exception as e:
-                logger.error(f"Error subscribing to batch {i//batch_size + 1}: {e}")
-                # Potentially retry or handle specific symbols failing
+                logger.error(f"Error subscribing symbols in batch {i//batch_size + 1}: {e}", exc_info=True)
+                # Decide how to handle batch failure: continue to next batch or stop?
+                # For now, it will log the error and continue to the next batch.
+                # Consider adding logic to retry the batch or specific symbols if needed.
 
         self.subscribed_symbols = successfully_subscribed
         if not self.subscribed_symbols:
-             logger.error("Failed to subscribe to any kline streams.")
+             logger.error("Failed to subscribe to any kline streams after processing all batches.")
              return False
 
         logger.info(f"Successfully subscribed to {len(self.subscribed_symbols)} kline streams.")
