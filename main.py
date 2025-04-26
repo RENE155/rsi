@@ -421,17 +421,21 @@ class RSIMonitor:
                 logger.warning("No push tokens found in database. Cannot send notification.")
                 return
 
-            tokens = [item['token'] for item in response.data if item.get('token')]
-            if not tokens:
+            tokens_raw = [item['token'] for item in response.data if item.get('token')]
+            if not tokens_raw:
                  logger.warning("No valid push tokens extracted from database response.")
                  return
 
-            logger.info(f"Found {len(tokens)} push tokens to notify.")
+            # Convert to a set to get unique tokens, then back to a list
+            unique_tokens = list(set(tokens_raw))
+
+            logger.info(f"Found {len(unique_tokens)} unique push tokens to notify (out of {len(tokens_raw)} total).")
 
             # 2. Send notifications to Expo (handle chunking if necessary)
             # Expo recommends sending in chunks of 100
             messages = []
-            for token in tokens:
+            # Iterate over unique_tokens instead of tokens
+            for token in unique_tokens:
                  # Basic validation: Expo tokens often start with ExponentPushToken[
                  if isinstance(token, str) and token.startswith("ExponentPushToken["):
                      messages.append({
