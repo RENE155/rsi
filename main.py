@@ -38,10 +38,10 @@ ALERT_COOLDOWN_SECONDS = int(os.getenv('ALERT_COOLDOWN_SECONDS', '300')) # 5 min
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 
 # WebSocket Config
-WS_PING_INTERVAL = 20
-WS_PING_TIMEOUT = 15
-HEARTBEAT_INTERVAL = 30 # Check connection every 30s
-NO_MESSAGE_TIMEOUT = 120 # Reconnect if no messages for 120s
+WS_PING_INTERVAL = 20  # Send ping every 20 seconds
+WS_PING_TIMEOUT = 10   # Wait up to 10 seconds for pong response
+HEARTBEAT_INTERVAL = 15 # Check connection every 15s instead of 30s
+NO_MESSAGE_TIMEOUT = 60 # Reconnect if no messages for 60s (reduced from 120s)
 MAX_RECONNECT_DELAY = 300 # Max delay between reconnect attempts
 
 # --- Logging Setup ---
@@ -88,7 +88,9 @@ class RSIMonitor:
         self.connected = False
         self.reconnect_count = 0
         self.last_message_time = 0
+        self.last_heartbeat_check = 0
         self._stop_event = threading.Event()
+        self._last_connected_log = 0
 
     def _get_all_symbols(self):
         """Get list of actively trading USDT linear perpetual symbols"""
@@ -136,34 +138,88 @@ class RSIMonitor:
                 except Exception as e:
                     logger.warning(f"Error closing existing WebSocket: {e}")
 
-            self.ws = WebSocket(
-                testnet=False,
-                channel_type="linear",
-                ping_interval=WS_PING_INTERVAL,
-                ping_timeout=WS_PING_TIMEOUT,
-                trace_logging=False # Set to True for debugging WS messages
-            )
-            self.connected = False # Mark as not connected until subscription succeeds
-            self.last_message_time = time.time() # Reset message timer
+            # Define a disconnect handler
+            def on_disconnect():
+                logger.warning("WebSocket disconnected via callback")
+                self.connected = False
+                self.last_message_time = 0  # Reset timer to trigger reconnect
+            
+            # Check if pybit WebSocket supports disconnect callback
+            # If not, we'll rely on our heartbeat monitor
+            try:
+                self.ws = WebSocket(
+                    testnet=False,
+                    channel_type="linear",
+                    ping_interval=WS_PING_INTERVAL,
+                    ping_timeout=WS_PING_TIMEOUT,
+                    trace_logging=False,  # Set to True for debugging WS messages
+                    on_disconnect=on_disconnect  # Add disconnect handler if supported
+                )
+            except TypeError:
+                # on_disconnect parameter not supported, use standard constructor
+                logger.info("Using standard WebSocket constructor (no disconnect handler)")
+                self.ws = WebSocket(
+                    testnet=False,
+                    channel_type="linear",
+                    ping_interval=WS_PING_INTERVAL,
+                    ping_timeout=WS_PING_TIMEOUT,
+                    trace_logging=False  # Set to True for debugging WS messages
+                )
+                
+            self.connected = False  # Mark as not connected until subscription succeeds
+            self.last_message_time = time.time()  # Reset message timer
             logger.info("WebSocket connection initialized.")
         except Exception as e:
             logger.error(f"WebSocket initialization error: {e}", exc_info=True)
-            self.ws = None # Ensure ws is None if init fails
+            self.ws = None  # Ensure ws is None if init fails
 
 
     def _heartbeat_monitor_thread(self):
         """Runs in a thread to monitor WebSocket connection health."""
         logger.info("Heartbeat monitor thread started.")
+        last_log_time = 0
+        
         while not self._stop_event.is_set():
             current_time = time.time()
-            if self.ws and self.last_message_time > 0 and (current_time - self.last_message_time > NO_MESSAGE_TIMEOUT) and len(self.subscribed_symbols) > 0:
-                logger.warning(f"No messages received for {NO_MESSAGE_TIMEOUT} seconds. Triggering reconnect.")
-                self.connected = False
-                # Reconnect will be handled by the main loop or another mechanism
-                # For simplicity, just log here and let the subscription process handle it
-                self.last_message_time = time.time() # Reset timer to avoid rapid reconnect triggers
-
+            
+            # If we have an active connection that hasn't received messages recently
+            if (self.ws and self.connected and 
+                self.last_message_time > 0 and 
+                (current_time - self.last_message_time > NO_MESSAGE_TIMEOUT) and 
+                len(self.subscribed_symbols) > 0):
+                
+                # Log less frequently to avoid flooding logs
+                if current_time - last_log_time > 60:  # Log at most once per minute
+                    logger.warning(f"No messages received for {int(current_time - self.last_message_time)} seconds (threshold: {NO_MESSAGE_TIMEOUT}s). Connection may be stale.")
+                    last_log_time = current_time
+                
+                # Actively test connection by trying to ping if supported by the library
+                try:
+                    # Mark connection as disconnected so the main loop will reconnect
+                    logger.info("Marking connection as disconnected to trigger reconnect")
+                    self.connected = False
+                    
+                    # Try to close the connection gracefully 
+                    if self.ws:
+                        try:
+                            self.ws.exit()
+                        except Exception as e:
+                            logger.warning(f"Error closing stale WebSocket: {e}")
+                except Exception as e:
+                    logger.error(f"Error during connection test: {e}")
+            
+            # Also do a quick ping test every 30s to ensure connection is responsive
+            elif (self.ws and self.connected and 
+                  self.last_message_time > 0 and
+                  (current_time - self.last_message_time > 30)):
+                logger.debug("Performing routine connection check")
+                
+                # Just mark the time, so we know heartbeat is running
+                # The websockets library already handles ping/pong internally
+                self.last_heartbeat_check = current_time
+                                
             time.sleep(HEARTBEAT_INTERVAL)
+        
         logger.info("Heartbeat monitor thread stopped.")
 
     def initialize_price_history(self):
@@ -262,21 +318,28 @@ class RSIMonitor:
 
         def handle_message_wrapper(message):
             """Wrapper to update last message time and call main handler"""
+            # Update connection state and last message time
             self.last_message_time = time.time()
-            self.connected = True # Mark as connected once messages flow
+            
+            # Only log this once per minute to avoid log spam
+            if not hasattr(self, '_last_connected_log') or time.time() - self._last_connected_log > 60:
+                if not self.connected:
+                    logger.info("WebSocket is receiving messages - marking as connected")
+                self._last_connected_log = time.time()
+            
+            self.connected = True  # Mark as connected once messages flow
+            
+            # Process the message content
             self._handle_kline_message(message)
 
         # Clear previous subscriptions before starting new ones
         self.subscribed_symbols.clear()
-        # We still need the symbols list, but not the topic strings list
-        # subscription_args = [f"kline.{KLINE_INTERVAL}.{symbol}" for symbol in self.symbols]
-
+        
         # Subscribe in batches to avoid potential issues with too many args at once
-        batch_size = 50 # Adjust batch size if needed, Bybit might have limits
+        batch_size = 25  # Smaller batch size (reduced from 50) to prevent overloading
         successfully_subscribed = set()
         for i in range(0, len(self.symbols), batch_size):
-            # batch = subscription_args[i:i+batch_size]
-            batch_symbols = self.symbols[i:i+batch_size] # Get symbols for the current batch
+            batch_symbols = self.symbols[i:i+batch_size]  # Get symbols for the current batch
             logger.info(f"Attempting to subscribe symbols in batch {i//batch_size + 1}/{(len(self.symbols)+batch_size-1)//batch_size}...")
             try:
                 symbols_in_batch_subscribed = 0
@@ -290,14 +353,14 @@ class RSIMonitor:
                     # Assuming success if no immediate exception
                     successfully_subscribed.add(symbol)
                     symbols_in_batch_subscribed += 1
-                    # Optional: Add a very small delay between subscriptions within a batch if needed
-                    # time.sleep(0.02)
+                    # Add a small delay between subscriptions to avoid overwhelming the server
+                    time.sleep(0.05)
 
                 logger.info(f"Subscribed {symbols_in_batch_subscribed} symbols in batch {i//batch_size + 1}. Total subscribed: {len(successfully_subscribed)}.")
                 # Add a delay between sending batches of subscription requests
                 if i + batch_size < len(self.symbols):
-                     logger.info("Waiting 1 second before next batch...")
-                     time.sleep(1)
+                     logger.info("Waiting 2 seconds before next batch...")
+                     time.sleep(2)  # Increased from 1 to 2 seconds for more time between batches
 
             except Exception as e:
                 logger.error(f"Error subscribing symbols in batch {i//batch_size + 1}: {e}", exc_info=True)
@@ -638,11 +701,22 @@ async def get_status():
     if not monitor:
         return {"status": "error", "message": "Monitor not initialized."}
 
-    with monitor.lock: # Use lock to safely access shared data
+    with monitor.lock:  # Use lock to safely access shared data
         rsi_count = len(monitor.rsi_values)
         tracked_symbols = len(monitor.symbols)
         subscribed_count = len(monitor.subscribed_symbols)
-
+        
+        # Calculate time since last message
+        time_since_last_msg = int(time.time() - monitor.last_message_time) if monitor.last_message_time else None
+        
+        # More accurate connection status determination
+        if not monitor.connected:
+            websocket_status = "disconnected"
+        elif time_since_last_msg and time_since_last_msg > 30:
+            websocket_status = "stale"  # Connection exists but no recent messages
+        else:
+            websocket_status = "connected"  # Actively receiving messages
+        
         # Get a snapshot of recent RSI values (e.g., top/bottom 5)
         # Sort items safely, handle potential NaN or missing values
         valid_rsi = {s: r for s, r in monitor.rsi_values.items() if pd.notna(r)}
@@ -650,11 +724,11 @@ async def get_status():
         top_5 = [{"symbol": s, "rsi": r} for s, r in sorted_rsi[:5]]
         bottom_5 = [{"symbol": s, "rsi": r} for s, r in sorted_rsi[-5:]]
 
-
     return {
         "status": "running" if monitor.is_running else "stopped",
+        "websocket_status": websocket_status,
         "websocket_connected": monitor.connected,
-        "last_message_time_ago_s": int(time.time() - monitor.last_message_time) if monitor.last_message_time else None,
+        "last_message_time_ago_s": time_since_last_msg,
         "tracked_symbol_count": tracked_symbols,
         "subscribed_symbol_count": subscribed_count,
         "rsi_calculated_count": rsi_count,
