@@ -138,13 +138,28 @@ class RSIMonitor:
                 except Exception as e:
                     logger.warning(f"Error closing existing WebSocket: {e}")
 
-            # Define a disconnect handler
+            # Define event handlers
             def on_disconnect():
-                logger.warning("WebSocket disconnected via callback")
+                # This might be called by pybit or our code
+                if self.connected:
+                    logger.warning("WebSocket disconnected via on_disconnect callback")
+                    self.connected = False
+                    self.last_message_time = 0 # Reset timer
+
+            def on_error(error):
+                # Log the specific error and mark as disconnected
+                logger.error(f"WebSocket encountered error via on_error callback: {error}", exc_info=True)
                 self.connected = False
-                self.last_message_time = 0  # Reset timer to trigger reconnect
-            
-            # Check if pybit WebSocket supports disconnect callback
+                self.last_message_time = 0 # Reset timer
+
+            def on_close():
+                # Log when the connection is closed and mark as disconnected
+                if self.connected: # Avoid logging if already marked disconnected
+                    logger.info("WebSocket connection closed via on_close callback")
+                    self.connected = False
+                    self.last_message_time = 0 # Reset timer
+
+            # Check if pybit WebSocket supports event handlers
             # If not, we'll rely on our heartbeat monitor
             try:
                 self.ws = WebSocket(
@@ -152,26 +167,29 @@ class RSIMonitor:
                     channel_type="linear",
                     ping_interval=WS_PING_INTERVAL,
                     ping_timeout=WS_PING_TIMEOUT,
-                    trace_logging=False,  # Set to True for debugging WS messages
-                    on_disconnect=on_disconnect  # Add disconnect handler if supported
+                    trace_logging=False,
+                    on_disconnect=on_disconnect,
+                    on_error=on_error,
+                    on_close=on_close
                 )
+                logger.info("WebSocket initialized with event handlers.")
             except TypeError:
-                # on_disconnect parameter not supported, use standard constructor
-                logger.info("Using standard WebSocket constructor (no disconnect handler)")
+                # Handlers not supported, use standard constructor
+                logger.warning("WebSocket event handlers (on_error, on_close) not supported by this pybit version. Relying on heartbeat.")
                 self.ws = WebSocket(
                     testnet=False,
                     channel_type="linear",
                     ping_interval=WS_PING_INTERVAL,
                     ping_timeout=WS_PING_TIMEOUT,
-                    trace_logging=False  # Set to True for debugging WS messages
+                    trace_logging=False
                 )
-                
-            self.connected = False  # Mark as not connected until subscription succeeds
-            self.last_message_time = time.time()  # Reset message timer
-            logger.info("WebSocket connection initialized.")
+
+            self.connected = False
+            self.last_message_time = time.time() # Initialize timer
+            logger.info("WebSocket initialization process complete.")
         except Exception as e:
             logger.error(f"WebSocket initialization error: {e}", exc_info=True)
-            self.ws = None  # Ensure ws is None if init fails
+            self.ws = None # Ensure ws is None if init fails
 
 
     def _heartbeat_monitor_thread(self):
@@ -598,21 +616,30 @@ class RSIMonitor:
 
                 # If connected, just sleep and let the WS thread handle messages
                 # The heartbeat monitor will trigger reconnect if needed
+                # Check connection status before sleeping
+                if not self.connected:
+                    logger.info("Connection lost (detected in main loop). Triggering reconnect sequence.")
+                    # No need to sleep, the loop will restart the connection attempt
+                    continue 
+                    
                 time.sleep(5) # Check loop status periodically
 
+            except (ConnectionRefusedError, ConnectionResetError) as conn_e:
+                # Specific network connection errors
+                logger.error(f"Network connection error in monitoring loop: {conn_e}")
+                self.connected = False
+                self.reconnect_count += 1
+                if self.ws:
+                    try: self.ws.exit() 
+                    except Exception: pass # Ignore errors during exit
+                    finally: self.ws = None
+                # Backoff handled at the start of the loop
+                
             except Exception as e:
-                 logger.error(f"Exception in monitoring loop: {e}", exc_info=True)
+                 # General catch-all for other unexpected errors
+                 logger.error(f"General exception in monitoring loop: {e}", exc_info=True)
                  self.connected = False # Assume connection lost on error
                  self.reconnect_count += 1
-                 # Close WebSocket if it exists to ensure clean state for reconnect attempt
-                 if self.ws:
-                     try:
-                         self.ws.exit()
-                     except Exception as ws_exit_e:
-                          logger.warning(f"Error closing WebSocket during exception handling: {ws_exit_e}")
-                     finally:
-                          self.ws = None
-                 time.sleep(5) # Wait a bit before retrying the loop
 
 
         logger.info("Monitoring loop requested to stop.")
