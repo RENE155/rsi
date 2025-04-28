@@ -142,20 +142,20 @@ class RSIMonitor:
             def on_disconnect():
                 # This might be called by pybit or our code
                 if self.connected:
-                    logger.warning("WebSocket disconnected via on_disconnect callback")
+                    logger.warning("WebSocket disconnected (on_disconnect callback triggered)")
                     self.connected = False
                     self.last_message_time = 0 # Reset timer
 
             def on_error(error):
                 # Log the specific error and mark as disconnected
-                logger.error(f"WebSocket encountered error via on_error callback: {error}", exc_info=True)
+                logger.error(f"WebSocket error (on_error callback triggered): {error}", exc_info=True)
                 self.connected = False
                 self.last_message_time = 0 # Reset timer
 
             def on_close():
                 # Log when the connection is closed and mark as disconnected
                 if self.connected: # Avoid logging if already marked disconnected
-                    logger.info("WebSocket connection closed via on_close callback")
+                    logger.info("WebSocket connection closed (on_close callback triggered)")
                     self.connected = False
                     self.last_message_time = 0 # Reset timer
 
@@ -208,13 +208,13 @@ class RSIMonitor:
                 
                 # Log less frequently to avoid flooding logs
                 if current_time - last_log_time > 60:  # Log at most once per minute
-                    logger.warning(f"No messages received for {int(current_time - self.last_message_time)} seconds (threshold: {NO_MESSAGE_TIMEOUT}s). Connection may be stale.")
+                    logger.warning(f"Heartbeat Monitor: No messages received for {int(current_time - self.last_message_time)} seconds (threshold: {NO_MESSAGE_TIMEOUT}s). Triggering reconnect.")
                     last_log_time = current_time
                 
                 # Actively test connection by trying to ping if supported by the library
                 try:
                     # Mark connection as disconnected so the main loop will reconnect
-                    logger.info("Marking connection as disconnected to trigger reconnect")
+                    logger.info("Heartbeat Monitor: Marking connection as disconnected to trigger reconnect.")
                     self.connected = False
                     
                     # Try to close the connection gracefully 
@@ -457,8 +457,13 @@ class RSIMonitor:
                      if is_closed: # Log final RSI for closed candles
                          logger.info(f"{symbol} RSI updated (CLOSED): {new_rsi:.2f}")
                      # Check threshold if RSI changed significantly or crossed threshold
-                     if np.isnan(prev_rsi) or abs(new_rsi - prev_rsi) > 0.1: # Avoid alerts on tiny fluctuations
-                           self._check_and_send_alert(symbol, new_rsi)
+                     if (
+                         np.isnan(prev_rsi)
+                         or abs(new_rsi - prev_rsi) > 0.1
+                         or (prev_rsi < OVERBOUGHT_THRESHOLD and new_rsi >= OVERBOUGHT_THRESHOLD)
+                         or (prev_rsi > OVERSOLD_THRESHOLD and new_rsi <= OVERSOLD_THRESHOLD)
+                     ):
+                         self._check_and_send_alert(symbol, new_rsi)
 
         except Exception as e:
             logger.error(f"Error processing kline message for {symbol if 'symbol' in locals() else 'unknown symbol'}: {e}", exc_info=True)
@@ -618,15 +623,15 @@ class RSIMonitor:
                 # The heartbeat monitor will trigger reconnect if needed
                 # Check connection status before sleeping
                 if not self.connected:
-                    logger.info("Connection lost (detected in main loop). Triggering reconnect sequence.")
+                    logger.info("Main Loop: Detected disconnected state. Initiating reconnection sequence.")
                     # No need to sleep, the loop will restart the connection attempt
-                    continue 
+                    continue
                     
                 time.sleep(5) # Check loop status periodically
 
             except (ConnectionRefusedError, ConnectionResetError) as conn_e:
                 # Specific network connection errors
-                logger.error(f"Network connection error in monitoring loop: {conn_e}")
+                logger.error(f"Main Loop: Network connection error ({type(conn_e).__name__}): {conn_e}")
                 self.connected = False
                 self.reconnect_count += 1
                 if self.ws:
@@ -637,7 +642,7 @@ class RSIMonitor:
                 
             except Exception as e:
                  # General catch-all for other unexpected errors
-                 logger.error(f"General exception in monitoring loop: {e}", exc_info=True)
+                 logger.error(f"Main Loop: General exception ({type(e).__name__}): {e}", exc_info=True)
                  self.connected = False # Assume connection lost on error
                  self.reconnect_count += 1
 
