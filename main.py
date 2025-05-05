@@ -91,6 +91,7 @@ class RSIMonitor:
         self.last_heartbeat_check = 0
         self._stop_event = threading.Event()
         self._last_connected_log = 0
+        self.funding_rates = {} # Added to store funding rates
 
     def _get_all_symbols(self):
         """Get list of actively trading USDT linear perpetual symbols"""
@@ -569,6 +570,49 @@ class RSIMonitor:
             logger.error(f"Failed to send push notification: {e}", exc_info=True)
 
 
+    def _get_current_funding_rate(self, symbol: str) -> float | None:
+        """
+        Fetches the current funding rate for a single symbol using the shared session.
+
+        Args:
+            symbol: The trading symbol (e.g., "BTCUSDT").
+
+        Returns:
+            The current funding rate as a float, or None if an error occurs or not found.
+        """
+        # Note: No need to check API keys here as self.session requires them at init
+        try:
+            # Use a short timeout for status checks to avoid blocking
+            result = self.session.get_tickers(category="linear", symbol=symbol)
+
+            if result and result.get("retCode") == 0:
+                ticker_info = result.get("result", {}).get("list", [])
+                if ticker_info:
+                    funding_rate_str = ticker_info[0].get("fundingRate")
+                    if funding_rate_str and funding_rate_str != "": # Ensure rate exists and is not empty string
+                        try:
+                            return float(funding_rate_str)
+                        except ValueError:
+                            logger.warning(f"Could not convert funding rate '{funding_rate_str}' to float for {symbol}.")
+                            return None
+                    else:
+                        # logger.debug(f"Funding rate key missing or empty in ticker info for {symbol}.")
+                        return None # Explicitly return None if key missing or empty
+                else:
+                    # logger.debug(f"No ticker list returned in API response for {symbol}.")
+                    return None
+            else:
+                # Log API errors, but maybe less verbosely for status checks unless debugging
+                # Avoid flooding logs if the endpoint is hit frequently
+                if result.get("retCode") != 10006: # 10006 is often a temporary timeout/overload error
+                     logger.warning(f"Bybit API error fetching ticker for {symbol} funding rate: {result.get('retMsg', 'Unknown error')} (Code: {result.get('retCode')})")
+                return None
+
+        except Exception as e:
+            # Log other exceptions like connection errors
+            logger.error(f"Exception fetching funding rate for {symbol}: {e}", exc_info=False) # Limit traceback spam
+            return None
+
     def _run_monitoring_loop(self):
         """Main loop to manage WebSocket connection and subscriptions."""
         logger.info("Monitoring loop thread started.")
@@ -753,8 +797,49 @@ async def get_status():
         # Sort items safely, handle potential NaN or missing values
         valid_rsi = {s: r for s, r in monitor.rsi_values.items() if pd.notna(r)}
         sorted_rsi = sorted(valid_rsi.items(), key=lambda item: item[1], reverse=True)
-        top_5 = [{"symbol": s, "rsi": r} for s, r in sorted_rsi[:5]]
-        bottom_5 = [{"symbol": s, "rsi": r} for s, r in sorted_rsi[-5:]]
+        top_5_rsi = sorted_rsi[:5]
+        bottom_5_rsi = sorted_rsi[-5:]
+
+        # Prepare results, fetch funding rates for top/bottom 5
+        results_top_5 = []
+        results_bottom_5 = []
+        symbols_to_check_funding = {s for s, r in top_5_rsi} | {s for s, r in bottom_5_rsi}
+
+        # Fetch funding rates for the relevant symbols
+        # This happens synchronously within the request - consider async or caching if slow
+        funding_rates_snapshot = {}
+        for symbol in symbols_to_check_funding:
+            rate = monitor._get_current_funding_rate(symbol)
+            if rate is not None:
+                monitor.funding_rates[symbol] = rate # Update shared cache
+                funding_rates_snapshot[symbol] = rate
+            # Use cached value if fetch fails but we have one
+            elif symbol in monitor.funding_rates:
+                 funding_rates_snapshot[symbol] = monitor.funding_rates[symbol]
+                 
+            # Small delay to avoid hitting rate limits aggressively if status is polled rapidly
+            time.sleep(0.05) 
+
+
+        # Populate results with RSI and Funding Rate
+        for symbol, rsi in top_5_rsi:
+            rate = funding_rates_snapshot.get(symbol)
+            results_top_5.append({
+                "symbol": symbol,
+                "rsi": round(rsi, 2) if pd.notna(rsi) else None,
+                "funding_rate": rate,
+                 "funding_rate_percent": f"{rate * 100:.4f}%" if rate is not None else None
+            })
+
+        for symbol, rsi in bottom_5_rsi:
+            rate = funding_rates_snapshot.get(symbol)
+            results_bottom_5.append({
+                "symbol": symbol,
+                "rsi": round(rsi, 2) if pd.notna(rsi) else None,
+                "funding_rate": rate,
+                "funding_rate_percent": f"{rate * 100:.4f}%" if rate is not None else None
+            })
+
 
     return {
         "status": "running" if monitor.is_running else "stopped",
@@ -765,8 +850,8 @@ async def get_status():
         "subscribed_symbol_count": subscribed_count,
         "rsi_calculated_count": rsi_count,
         "reconnect_attempts": monitor.reconnect_count,
-        "top_5_rsi": top_5,
-        "bottom_5_rsi": bottom_5,
+        "top_5_rsi": results_top_5,    # Use updated list
+        "bottom_5_rsi": results_bottom_5, # Use updated list
     }
 
 # Add other endpoints if needed, e.g., manually trigger history refresh, etc.
