@@ -92,6 +92,8 @@ class RSIMonitor:
         self._stop_event = threading.Event()
         self._last_connected_log = 0
         self.funding_rates = {} # Added to store funding rates
+        self.daily_rsi_cache = {} # Cache for daily RSI values
+        self.daily_rsi_cache_time = {} # Cache timestamps for daily RSI values
 
     def _get_all_symbols(self):
         """Get list of actively trading USDT linear perpetual symbols"""
@@ -126,6 +128,80 @@ class RSIMonitor:
         except Exception as e:
             logger.error(f"Error getting symbols: {e}", exc_info=True)
             return []
+
+    def get_rsi_for_interval(self, symbol, interval):
+        """
+        Calculate RSI for a specific symbol and interval
+        
+        Args:
+            symbol (str): Trading symbol like "BTCUSDT"
+            interval (str): Kline interval like "240" (4h) or "D" (1d)
+            
+        Returns:
+            float or None: RSI value or None if error occurs
+        """
+        try:
+            # Check cache for daily values to reduce API calls
+            if interval == "D":
+                cache_key = f"{symbol}_{interval}"
+                # Return cached value if less than 1 hour old
+                now = time.time()
+                if (cache_key in self.daily_rsi_cache and 
+                    cache_key in self.daily_rsi_cache_time and
+                    now - self.daily_rsi_cache_time[cache_key] < 3600):
+                    logger.debug(f"Using cached daily RSI for {symbol}: {self.daily_rsi_cache[cache_key]}")
+                    return self.daily_rsi_cache[cache_key]
+            
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    kline_data = self.session.get_kline(
+                        category="linear",
+                        symbol=symbol,
+                        interval=interval,
+                        limit=RSI_PERIODS + 50  # Get enough data for RSI calculation
+                    )
+                    
+                    if kline_data.get("retCode", -1) != 0:
+                        msg = kline_data.get('retMsg', 'Unknown API error')
+                        logger.warning(f"API error getting {interval} kline for {symbol}: {msg}")
+                        if "rate limit" in msg.lower():
+                            wait_time = 1 * (2 ** attempt)
+                            logger.warning(f"Rate limit hit. Waiting {wait_time}s...")
+                            time.sleep(wait_time)
+                            continue
+                        return None
+                    
+                    if not kline_data.get("result", {}).get("list"):
+                        logger.warning(f"No {interval} kline data returned for {symbol}")
+                        return None
+                        
+                    prices = [float(k[4]) for k in kline_data["result"]["list"]]
+                    prices.reverse()  # API returns newest first
+                    
+                    if len(prices) >= RSI_PERIODS + 1:
+                        rsi = calculate_rsi(pd.Series(prices))
+                        if not np.isnan(rsi):
+                            # Cache daily RSI values
+                            if interval == "D":
+                                self.daily_rsi_cache[f"{symbol}_{interval}"] = rsi
+                                self.daily_rsi_cache_time[f"{symbol}_{interval}"] = time.time()
+                            return rsi
+                    else:
+                        logger.warning(f"Insufficient data for {symbol} {interval} RSI calculation")
+                    
+                    return None
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = 1 * (2 ** attempt)
+                        logger.warning(f"Error getting {interval} RSI for {symbol} (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"Failed to get {interval} RSI for {symbol} after {max_retries} attempts: {e}")
+                        return None
+        except Exception as e:
+            logger.error(f"Unexpected error calculating {interval} RSI for {symbol}: {e}", exc_info=True)
+            return None
 
     def init_websocket(self):
         """Initialize or reinitialize the WebSocket connection"""
@@ -803,12 +879,11 @@ async def get_status():
         # Prepare results, fetch funding rates for top/bottom 5
         results_top_5 = []
         results_bottom_5 = []
-        symbols_to_check_funding = {s for s, r in top_5_rsi} | {s for s, r in bottom_5_rsi}
+        symbols_to_check = {s for s, r in top_5_rsi} | {s for s, r in bottom_5_rsi}
 
         # Fetch funding rates for the relevant symbols
-        # This happens synchronously within the request - consider async or caching if slow
         funding_rates_snapshot = {}
-        for symbol in symbols_to_check_funding:
+        for symbol in symbols_to_check:
             rate = monitor._get_current_funding_rate(symbol)
             if rate is not None:
                 monitor.funding_rates[symbol] = rate # Update shared cache
@@ -818,24 +893,36 @@ async def get_status():
                  funding_rates_snapshot[symbol] = monitor.funding_rates[symbol]
                  
             # Small delay to avoid hitting rate limits aggressively if status is polled rapidly
-            time.sleep(0.05) 
+            time.sleep(0.05)
 
+        # Fetch daily RSI values for symbols
+        daily_rsi_values = {}
+        for symbol in symbols_to_check:
+            # Use "D" for daily interval
+            daily_rsi = monitor.get_rsi_for_interval(symbol, "D")
+            if daily_rsi is not None:
+                daily_rsi_values[symbol] = round(daily_rsi, 2)
+            time.sleep(0.1)  # Add delay to avoid rate limits
 
-        # Populate results with RSI and Funding Rate
+        # Populate results with RSI, Daily RSI, and Funding Rate
         for symbol, rsi in top_5_rsi:
             rate = funding_rates_snapshot.get(symbol)
+            daily_rsi = daily_rsi_values.get(symbol)
             results_top_5.append({
                 "symbol": symbol,
                 "rsi": round(rsi, 2) if pd.notna(rsi) else None,
+                "daily_rsi": daily_rsi,  # Add daily RSI value
                 "funding_rate": rate,
-                 "funding_rate_percent": f"{rate * 100:.4f}%" if rate is not None else None
+                "funding_rate_percent": f"{rate * 100:.4f}%" if rate is not None else None
             })
 
         for symbol, rsi in bottom_5_rsi:
             rate = funding_rates_snapshot.get(symbol)
+            daily_rsi = daily_rsi_values.get(symbol)
             results_bottom_5.append({
                 "symbol": symbol,
                 "rsi": round(rsi, 2) if pd.notna(rsi) else None,
+                "daily_rsi": daily_rsi,  # Add daily RSI value
                 "funding_rate": rate,
                 "funding_rate_percent": f"{rate * 100:.4f}%" if rate is not None else None
             })
@@ -850,8 +937,8 @@ async def get_status():
         "subscribed_symbol_count": subscribed_count,
         "rsi_calculated_count": rsi_count,
         "reconnect_attempts": monitor.reconnect_count,
-        "top_5_rsi": results_top_5,    # Use updated list
-        "bottom_5_rsi": results_bottom_5, # Use updated list
+        "top_5_rsi": results_top_5,
+        "bottom_5_rsi": results_bottom_5,
     }
 
 # Add other endpoints if needed, e.g., manually trigger history refresh, etc.
