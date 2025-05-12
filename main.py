@@ -80,10 +80,10 @@ class RSIMonitor:
         self.ws = None # WebSocket object, initialized later
         self.price_data = defaultdict(list)
         self.symbols = []
-        self.subscribed_symbols = set() # Tracks symbols successfully subscribed via WS
+        self.subscribed_symbols = set()
         self.lock = threading.Lock()
         self.is_running = False
-        self.rsi_values = defaultdict(dict) # Changed: Stores RSI per interval, e.g., {"BTCUSDT": {"240": 70.5, "D": 65.1}}
+        self.rsi_values = {}
         self.last_alert_time = defaultdict(float)
         self.connected = False
         self.reconnect_count = 0
@@ -91,9 +91,9 @@ class RSIMonitor:
         self.last_heartbeat_check = 0
         self._stop_event = threading.Event()
         self._last_connected_log = 0
-        self.funding_rates = {} # Stores current funding rate per symbol
-        self.monitor_thread = None # Thread for main WS loop
-        self.aux_data_thread = None # Thread for auxiliary data fetching (1D RSI)
+        self.funding_rates = {} # Added to store funding rates
+        self.daily_rsi_cache = {} # Cache for daily RSI values
+        self.daily_rsi_cache_time = {} # Cache timestamps for daily RSI values
 
     def _get_all_symbols(self):
         """Get list of actively trading USDT linear perpetual symbols"""
@@ -141,7 +141,17 @@ class RSIMonitor:
             float or None: RSI value or None if error occurs
         """
         try:
-            # Removed daily RSI caching logic - now handled by background task/stored in self.rsi_values
+            # Check cache for daily values to reduce API calls
+            if interval == "D":
+                cache_key = f"{symbol}_{interval}"
+                # Return cached value if less than 1 hour old
+                now = time.time()
+                if (cache_key in self.daily_rsi_cache and 
+                    cache_key in self.daily_rsi_cache_time and
+                    now - self.daily_rsi_cache_time[cache_key] < 3600):
+                    logger.debug(f"Using cached daily RSI for {symbol}: {self.daily_rsi_cache[cache_key]}")
+                    return self.daily_rsi_cache[cache_key]
+            
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -172,7 +182,10 @@ class RSIMonitor:
                     if len(prices) >= RSI_PERIODS + 1:
                         rsi = calculate_rsi(pd.Series(prices))
                         if not np.isnan(rsi):
-                            # Don't cache here anymore
+                            # Cache daily RSI values
+                            if interval == "D":
+                                self.daily_rsi_cache[f"{symbol}_{interval}"] = rsi
+                                self.daily_rsi_cache_time[f"{symbol}_{interval}"] = time.time()
                             return rsi
                     else:
                         logger.warning(f"Insufficient data for {symbol} {interval} RSI calculation")
@@ -315,13 +328,9 @@ class RSIMonitor:
 
         with self.lock:
             self.price_data.clear()
-            self.rsi_values.clear() # Clears the nested dict
-            self.funding_rates.clear()
+            self.rsi_values.clear()
 
         total_symbols = len(self.symbols)
-        logger.info(f"Initializing data for {total_symbols} symbols (4H RSI, 1D RSI, Funding Rate)...")
-        initial_fetch_delay = 0.1 # Delay between symbols during initial fetch
-        
         for idx, symbol in enumerate(self.symbols, 1):
             if not self.is_running:
                 logger.info("Stopping price history initialization.")
@@ -329,92 +338,66 @@ class RSIMonitor:
 
             logger.info(f"Initializing {symbol} ({idx}/{total_symbols})...")
             try:
-                # 1. Fetch Historical Kline for Primary Interval (4H)
-                kline_data_4h = None
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        kline_data_4h = self.session.get_kline(
+                        kline_data = self.session.get_kline(
                             category="linear",
                             symbol=symbol,
-                            interval=KLINE_INTERVAL, # Use the primary interval (e.g., "240")
+                            interval=KLINE_INTERVAL,
                             limit=RSI_PERIODS + 100 # Get enough data for initial RSI + buffer
                         )
-                        if kline_data_4h.get("retCode", -1) != 0:
-                            msg = kline_data_4h.get('retMsg', 'Unknown API error')
-                            logger.warning(f"API error getting {KLINE_INTERVAL} kline for {symbol}: {msg}")
+                        if kline_data.get("retCode", -1) != 0:
+                            msg = kline_data.get('retMsg', 'Unknown API error')
+                            logger.warning(f"API error for {symbol}: {msg}")
                             if "rate limit" in msg.lower():
                                 wait_time = 1 * (2 ** attempt)
                                 logger.warning(f"Rate limit hit for {symbol}. Waiting {wait_time}s...")
                                 time.sleep(wait_time)
                                 continue # Retry
                             else:
-                                break # Non-rate-limit error
+                                # Break for non-rate-limit errors after logging
+                                break
                         break # Success
                     except Exception as e:
                         if attempt < max_retries - 1:
                             wait_time = 1 * (2 ** attempt)
-                            logger.warning(f"Failed to get {KLINE_INTERVAL} kline for {symbol} (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                            logger.warning(f"Failed to get kline for {symbol} (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait_time}s...")
                             time.sleep(wait_time)
                         else:
-                            logger.error(f"Failed to get {KLINE_INTERVAL} kline for {symbol} after {max_retries} attempts.")
-                            # Continue to next step even if this fails, maybe log symbol as problematic
-                            break 
-                
-                # Process 4H Kline Data
-                if kline_data_4h and kline_data_4h.get("retCode") == 0 and kline_data_4h.get("result", {}).get("list"):
-                    prices = [float(k[4]) for k in kline_data_4h["result"]["list"]]
+                            logger.error(f"Failed to get kline for {symbol} after {max_retries} attempts.", exc_info=True)
+                            raise # Reraise after max retries
+
+                if kline_data.get("retCode") == 0 and kline_data.get("result", {}).get("list"):
+                    prices = [float(k[4]) for k in kline_data["result"]["list"]]
                     prices.reverse() # API returns newest first
 
                     if len(prices) >= RSI_PERIODS + 1:
                         with self.lock:
-                            self.price_data[symbol] = prices # Store price history for WS updates
-                            rsi_4h = calculate_rsi(pd.Series(prices))
-                            if not np.isnan(rsi_4h):
-                                self.rsi_values[symbol][KLINE_INTERVAL] = round(rsi_4h, 2)
-                                logger.debug(f"Initial {KLINE_INTERVAL} RSI for {symbol}: {self.rsi_values[symbol][KLINE_INTERVAL]:.2f}")
-                                # Check initial threshold (based on primary interval)
-                                self._check_and_send_alert(symbol, rsi_4h, is_initial=True)
+                            self.price_data[symbol] = prices
+                            rsi = calculate_rsi(pd.Series(prices))
+                            if not np.isnan(rsi):
+                                self.rsi_values[symbol] = rsi
+                                logger.info(f"Initial RSI for {symbol}: {rsi:.2f}")
+                                # Check initial threshold without cooldown
+                                self._check_and_send_alert(symbol, rsi, is_initial=True)
+                        logger.info(f"Loaded {len(prices)} historical prices for {symbol}. Initial RSI: {self.rsi_values.get(symbol, 'N/A')}")
                     else:
-                        logger.warning(f"Insufficient historical data for {symbol} {KLINE_INTERVAL} RSI ({len(prices)} points). Need {RSI_PERIODS + 1}.")
+                        logger.warning(f"Insufficient historical data for {symbol} ({len(prices)} points). Need {RSI_PERIODS + 1}.")
                 else:
-                     logger.warning(f"Could not retrieve valid {KLINE_INTERVAL} kline data for {symbol}. API Response: {kline_data_4h}")
+                     logger.warning(f"Could not retrieve valid kline data for {symbol}. API Response: {kline_data}")
 
-                # 2. Fetch Initial 1D RSI (using the modified function)
-                try:
-                    rsi_1d = self.get_rsi_for_interval(symbol, "D")
-                    if rsi_1d is not None and not np.isnan(rsi_1d):
-                         with self.lock:
-                             self.rsi_values[symbol]["D"] = round(rsi_1d, 2)
-                         logger.debug(f"Initial 1D RSI for {symbol}: {self.rsi_values[symbol]['D']:.2f}")
-                    # else: logger.warning(f"Could not get initial 1D RSI for {symbol}")
-                except Exception as e:
-                    logger.error(f"Error getting initial 1D RSI for {symbol}: {e}")
-
-                # 3. Fetch Initial Funding Rate (one REST poll at startup)
-                # WebSocket tickers stream will take over after connection
-                try:
-                    funding_rate = self._get_current_funding_rate(symbol)
-                    if funding_rate is not None:
-                        with self.lock:
-                             self.funding_rates[symbol] = funding_rate
-                        logger.debug(f"Initial Funding Rate for {symbol}: {funding_rate}")
-                    # else: logger.warning(f"Could not get initial funding rate for {symbol}")
-                except Exception as e:
-                    logger.error(f"Error getting initial funding rate for {symbol}: {e}")
-
-                # Delay before processing next symbol
-                time.sleep(initial_fetch_delay)
+                time.sleep(0.2) # Avoid hitting rate limits
 
             except Exception as e:
-                logger.error(f"Error initializing data for {symbol}: {e}", exc_info=True)
+                logger.error(f"Error initializing price history for {symbol}: {e}", exc_info=True)
                 continue # Continue with the next symbol
 
-        logger.info("Initial data fetching complete.")
+        logger.info("Historical data initialization complete.")
         return True # Indicate success
 
-    def subscribe_to_streams(self):
-        """Subscribe to WebSocket kline and ticker streams for all symbols"""
+    def subscribe_to_klines(self):
+        """Subscribe to WebSocket kline streams for all symbols"""
         if not self.ws:
             logger.error("WebSocket not initialized. Cannot subscribe.")
             return False
@@ -426,147 +409,142 @@ class RSIMonitor:
                 logger.error("Cannot subscribe: Failed to fetch symbols.")
                 return False
 
-        logger.info(f"Starting WebSocket subscriptions for {len(self.symbols)} symbols (Klines: {KLINE_INTERVAL}, Tickers)...")
+        logger.info("Starting WebSocket kline subscriptions...")
 
-        def handle_kline_message_wrapper(message):
-            """Wrapper to update last message time and call kline handler"""
+        def handle_message_wrapper(message):
+            """Wrapper to update last message time and call main handler"""
+            # Update connection state and last message time
             self.last_message_time = time.time()
+            
+            # Only log this once per minute to avoid log spam
             if not hasattr(self, '_last_connected_log') or time.time() - self._last_connected_log > 60:
                 if not self.connected:
-                    logger.info("WS receiving kline messages - marking as connected")
+                    logger.info("WebSocket is receiving messages - marking as connected")
                 self._last_connected_log = time.time()
-            self.connected = True
+            
+            self.connected = True  # Mark as connected once messages flow
+            
+            # Process the message content
             self._handle_kline_message(message)
-        
-        def handle_ticker_message_wrapper(message):
-            """Wrapper to update last message time and call ticker handler"""
-            # Ticker messages update last_message_time and connected status inside _handle_ticker_message
-            self._handle_ticker_message(message)
 
         # Clear previous subscriptions before starting new ones
         self.subscribed_symbols.clear()
         
-        # Subscribe in batches 
-        batch_size = 20  # Reduced batch size further for safety with two stream types
+        # Subscribe in batches to avoid potential issues with too many args at once
+        batch_size = 25  # Smaller batch size (reduced from 50) to prevent overloading
         successfully_subscribed = set()
-        total_batches = (len(self.symbols) + batch_size - 1) // batch_size
-        
         for i in range(0, len(self.symbols), batch_size):
-            batch_symbols = self.symbols[i:i+batch_size]
-            batch_num = i // batch_size + 1
-            logger.info(f"Attempting subscriptions for batch {batch_num}/{total_batches} ({len(batch_symbols)} symbols)..." )
-            
-            subscriptions_in_batch = 0
+            batch_symbols = self.symbols[i:i+batch_size]  # Get symbols for the current batch
+            logger.info(f"Attempting to subscribe symbols in batch {i//batch_size + 1}/{(len(self.symbols)+batch_size-1)//batch_size}...")
             try:
-                # Subscribe to Klines for the batch
-                kline_args = [f"kline.{KLINE_INTERVAL}.{s}" for s in batch_symbols]
-                self.ws.subscribe(kline_args, callback=handle_kline_message_wrapper)
-                logger.debug(f"Batch {batch_num}: Subscribed to {len(kline_args)} kline streams.")
-                subscriptions_in_batch += len(kline_args)
-                time.sleep(0.5) # Small delay between stream types within batch
+                symbols_in_batch_subscribed = 0
+                for symbol in batch_symbols:
+                    # Use the specific kline_stream method for each symbol
+                    self.ws.kline_stream(
+                        symbol=symbol,
+                        interval=KLINE_INTERVAL,
+                        callback=handle_message_wrapper
+                    )
+                    # Assuming success if no immediate exception
+                    successfully_subscribed.add(symbol)
+                    symbols_in_batch_subscribed += 1
+                    # Add a small delay between subscriptions to avoid overwhelming the server
+                    time.sleep(0.05)
 
-                # Subscribe to Tickers for the batch
-                ticker_args = [f"tickers.{s}" for s in batch_symbols]
-                self.ws.subscribe(ticker_args, callback=handle_ticker_message_wrapper)
-                logger.debug(f"Batch {batch_num}: Subscribed to {len(ticker_args)} ticker streams.")
-                subscriptions_in_batch += len(ticker_args)
-                
-                # Assume success for the symbols in this batch if no exception
-                successfully_subscribed.update(batch_symbols)
-                logger.info(f"Batch {batch_num}: Submitted {subscriptions_in_batch} subscriptions. Total symbols subscribed: {len(successfully_subscribed)}")
+                logger.info(f"Subscribed {symbols_in_batch_subscribed} symbols in batch {i//batch_size + 1}. Total subscribed: {len(successfully_subscribed)}.")
+                # Add a delay between sending batches of subscription requests
+                if i + batch_size < len(self.symbols):
+                     logger.info("Waiting 2 seconds before next batch...")
+                     time.sleep(2)  # Increased from 1 to 2 seconds for more time between batches
 
             except Exception as e:
-                logger.error(f"Error subscribing streams in batch {batch_num}: {e}", exc_info=True)
-                # Consider which symbols failed if possible, but for now, log and continue
-            
-            # Wait before next batch
-            if i + batch_size < len(self.symbols):
-                 logger.info("Waiting 2 seconds before next batch...")
-                 time.sleep(2)
+                logger.error(f"Error subscribing symbols in batch {i//batch_size + 1}: {e}", exc_info=True)
+                # Decide how to handle batch failure: continue to next batch or stop?
+                # For now, it will log the error and continue to the next batch.
+                # Consider adding logic to retry the batch or specific symbols if needed.
 
         self.subscribed_symbols = successfully_subscribed
         if not self.subscribed_symbols:
-             logger.error("Failed to subscribe to any streams after processing all batches.")
+             logger.error("Failed to subscribe to any kline streams after processing all batches.")
              return False
 
-        logger.info(f"Successfully submitted subscriptions for {len(self.subscribed_symbols)} symbols.")
+        logger.info(f"Successfully subscribed to {len(self.subscribed_symbols)} kline streams.")
         self.last_message_time = time.time() # Reset timer after successful subscriptions
-        # self.connected will be set to True by the first message received by wrappers
-        self.reconnect_count = 0 # Reset reconnect counter on successful subscription attempt
+        self.connected = True
+        self.reconnect_count = 0 # Reset reconnect counter on successful subscription
         return True
 
     def _handle_kline_message(self, message):
-        """Process incoming kline WebSocket messages and update RSI values for KLINE_INTERVAL"""
+        """Process incoming kline WebSocket messages and update RSI values"""
         try:
-            topic = message.get("topic", "")
-            data_list = message.get("data", [])
-
-            if not topic.startswith(f"kline.{KLINE_INTERVAL}.") or not data_list:
-                # logger.debug(f"Ignoring non-kline or empty message for interval {KLINE_INTERVAL}: {message}")
+            if "topic" not in message or "data" not in message or not message["data"]:
+                # logger.debug(f"Ignoring non-kline or empty message: {message}")
                 return
 
-            # Extract symbol from topic, e.g., "kline.240.BTCUSDT"
-            try:
-                symbol = topic.split(".")[-1]
-            except IndexError:
-                logger.warning(f"Could not extract symbol from kline topic: {topic}")
-                return
+            topic = message["topic"]
+            symbol = topic.split(".")[2] # Assumes topic format "kline.INTERVAL.SYMBOL"
 
             if symbol not in self.symbols:
-                 logger.warning(f"Received kline message for unexpected/untracked symbol: {symbol}")
+                 logger.warning(f"Received message for unexpected symbol: {symbol}")
                  return # Ignore symbols we didn't intend to track
 
-            data = data_list[0] # Data is usually a list containing one dictionary
+            data = message["data"][0]
             is_closed = data.get("confirm", False)
             current_price = float(data["close"])
-            # timestamp_ms = int(data["start"]) # Start time of the candle - potentially useful later
+            timestamp_ms = int(data["start"]) # Start time of the candle
 
             with self.lock:
                 current_prices = self.price_data.get(symbol, [])
                 new_rsi = np.nan
 
                 if is_closed:
-                     # Add the closing price
-                     self.price_data[symbol].append(current_price)
-                     # Keep buffer size reasonable
-                     if len(self.price_data[symbol]) > RSI_PERIODS + 200:
-                         self.price_data[symbol] = self.price_data[symbol][-(RSI_PERIODS + 200):]
-                     # logger.debug(f"CLOSED candle for {symbol} ({KLINE_INTERVAL}). Price: {current_price}. History length: {len(self.price_data[symbol])}")
-                     # Recalculate RSI on closed candle
-                     price_series = pd.Series(self.price_data[symbol])
-                     new_rsi = calculate_rsi(price_series)
+                    # Check if this candle is newer than the last recorded price
+                    # This logic might need refinement based on how timestamps/updates work
+                    if not current_prices or timestamp_ms > getattr(current_prices[-1], 'timestamp_ms', 0):
+                         # Add the price (maybe store timestamp too if needed)
+                         self.price_data[symbol].append(current_price)
+                         # Keep buffer size reasonable
+                         if len(self.price_data[symbol]) > RSI_PERIODS + 200:
+                             self.price_data[symbol] = self.price_data[symbol][-(RSI_PERIODS + 200):]
+                         logger.debug(f"CLOSED candle for {symbol}. Price: {current_price}. History length: {len(self.price_data[symbol])}")
+                         # Recalculate RSI on closed candle
+                         price_series = pd.Series(self.price_data[symbol])
+                         new_rsi = calculate_rsi(price_series)
+
                 else: # Unconfirmed (intermediate) candle update
                     if not current_prices:
                         # Should ideally not happen if history is initialized, but handle defensively
                         self.price_data[symbol].append(current_price)
-                        # logger.debug(f"First price point (unconfirmed) for {symbol} ({KLINE_INTERVAL}): {current_price}")
+                        logger.debug(f"First price point (unconfirmed) for {symbol}: {current_price}")
                     else:
                         # Create a temporary series with the latest price updated
                         temp_prices = current_prices[:-1] + [current_price]
                         price_series = pd.Series(temp_prices)
                         new_rsi = calculate_rsi(price_series)
+                        # Optional: Log only significant changes for unconfirmed candles to reduce noise
+                        # prev_rsi = self.rsi_values.get(symbol)
+                        # if prev_rsi is None or abs(new_rsi - prev_rsi) > 1:
+                        #      logger.debug(f"Intermediate RSI for {symbol}: {new_rsi:.2f}")
+
 
                 # Store and check threshold if RSI is valid
                 if not np.isnan(new_rsi):
-                     new_rsi_rounded = round(new_rsi, 2)
-                     prev_rsi = self.rsi_values.get(symbol, {}).get(KLINE_INTERVAL)
-                     # Update the specific interval in the nested dict
-                     self.rsi_values[symbol][KLINE_INTERVAL] = new_rsi_rounded
-                     
+                     prev_rsi = self.rsi_values.get(symbol, np.nan)
+                     self.rsi_values[symbol] = new_rsi
                      if is_closed: # Log final RSI for closed candles
-                         logger.info(f"{symbol} RSI ({KLINE_INTERVAL}) updated (CLOSED): {new_rsi_rounded:.2f}")
-                     
-                     # Check threshold ONLY for the primary interval (KLINE_INTERVAL)
-                     if ( prev_rsi is None
-                          or abs(new_rsi_rounded - prev_rsi) > 0.1 # Check if changed significantly
-                          or (prev_rsi < OVERBOUGHT_THRESHOLD and new_rsi_rounded >= OVERBOUGHT_THRESHOLD)
-                          or (prev_rsi > OVERSOLD_THRESHOLD and new_rsi_rounded <= OVERSOLD_THRESHOLD)
-                      ):
-                         self._check_and_send_alert(symbol, new_rsi_rounded)
+                         logger.info(f"{symbol} RSI updated (CLOSED): {new_rsi:.2f}")
+                     # Check threshold if RSI changed significantly or crossed threshold
+                     if (
+                         np.isnan(prev_rsi)
+                         or abs(new_rsi - prev_rsi) > 0.1
+                         or (prev_rsi < OVERBOUGHT_THRESHOLD and new_rsi >= OVERBOUGHT_THRESHOLD)
+                         or (prev_rsi > OVERSOLD_THRESHOLD and new_rsi <= OVERSOLD_THRESHOLD)
+                     ):
+                         self._check_and_send_alert(symbol, new_rsi)
 
         except Exception as e:
             logger.error(f"Error processing kline message for {symbol if 'symbol' in locals() else 'unknown symbol'}: {e}", exc_info=True)
-            logger.error(f"Problematic kline message: {message}")
+            logger.error(f"Problematic message: {message}")
 
 
     def _check_and_send_alert(self, symbol, rsi, is_initial=False):
@@ -668,32 +646,6 @@ class RSIMonitor:
             logger.error(f"Failed to send push notification: {e}", exc_info=True)
 
 
-    def _handle_ticker_message(self, message):
-        """Process incoming ticker WebSocket messages and update funding rates."""
-        try:
-            if message.get("topic", "").startswith("tickers.") and message.get("type") == "snapshot":
-                data = message.get("data", {})
-                symbol = data.get("symbol")
-                funding_rate_str = data.get("fundingRate")
-
-                if symbol and funding_rate_str and symbol in self.symbols:
-                    try:
-                        funding_rate = float(funding_rate_str)
-                        with self.lock:
-                            if self.funding_rates.get(symbol) != funding_rate:
-                                # logger.debug(f"Funding rate for {symbol} updated via WS: {funding_rate}")
-                                self.funding_rates[symbol] = funding_rate
-                        self.last_message_time = time.time() # Also update last message time on ticker updates
-                        self.connected = True
-                    except ValueError:
-                        logger.warning(f"Could not convert funding rate '{funding_rate_str}' from ticker WS for {symbol}")
-            # else:
-                # logger.debug(f"Ignoring non-ticker snapshot message: {message}")
-
-        except Exception as e:
-            logger.error(f"Error processing ticker message: {e}", exc_info=True)
-            logger.error(f"Problematic ticker message: {message}")
-
     def _get_current_funding_rate(self, symbol: str) -> float | None:
         """
         Fetches the current funding rate for a single symbol using the shared session.
@@ -737,54 +689,6 @@ class RSIMonitor:
             logger.error(f"Exception fetching funding rate for {symbol}: {e}", exc_info=False) # Limit traceback spam
             return None
 
-    def _update_auxiliary_data_loop(self):
-        """Runs in a thread to periodically fetch 1D RSI for all symbols."""
-        logger.info("Auxiliary data fetching loop started (1D RSI). Interval: 300s")
-        fetch_interval_seconds = 300 # Fetch every 5 minutes
-        api_call_delay = 0.2 # Delay between API calls within the loop
-
-        while not self._stop_event.is_set():
-            start_time = time.time()
-            logger.info("Starting periodic 1D RSI update cycle...")
-            symbols_to_update = self.symbols # Get current list of symbols
-            updated_count = 0
-            error_count = 0
-
-            for symbol in symbols_to_update:
-                if self._stop_event.is_set():
-                    break # Exit loop if stop signal received
-
-                try:
-                    # Use get_rsi_for_interval (which no longer caches internally)
-                    daily_rsi = self.get_rsi_for_interval(symbol, "D")
-                    
-                    if daily_rsi is not None and not np.isnan(daily_rsi):
-                        with self.lock: # Acquire lock to update shared dict
-                            self.rsi_values[symbol]["D"] = round(daily_rsi, 2)
-                        updated_count += 1
-                        # logger.debug(f"Updated 1D RSI for {symbol}: {self.rsi_values[symbol]['D']}")
-                    else:
-                        # Optionally handle cases where RSI couldn't be calculated (e.g., log, keep old value)
-                        # logger.warning(f"Could not get 1D RSI for {symbol}")
-                        pass 
-                except Exception as e:
-                    logger.error(f"Error fetching 1D RSI for {symbol} in background task: {e}")
-                    error_count += 1
-                
-                # Wait before the next symbol to avoid rate limits
-                time.sleep(api_call_delay)
-
-            cycle_duration = time.time() - start_time
-            logger.info(f"Periodic 1D RSI update cycle finished in {cycle_duration:.2f}s. Updated: {updated_count}, Errors: {error_count}")
-
-            # Wait for the next interval, accounting for cycle duration
-            wait_time = max(0, fetch_interval_seconds - cycle_duration)
-            if wait_time > 0:
-                # Use event wait for faster shutdown response
-                self._stop_event.wait(timeout=wait_time)
-
-        logger.info("Auxiliary data fetching loop stopped.")
-
     def _run_monitoring_loop(self):
         """Main loop to manage WebSocket connection and subscriptions."""
         logger.info("Monitoring loop thread started.")
@@ -819,9 +723,9 @@ class RSIMonitor:
                               self.reconnect_count += 1
                               continue
 
-                     # Subscribe to streams
-                     if not self.subscribe_to_streams():
-                         logger.error("Failed to subscribe to streams. Retrying...")
+                     # Subscribe to klines
+                     if not self.subscribe_to_klines():
+                         logger.error("Failed to subscribe to kline streams. Retrying...")
                          self.reconnect_count += 1
                          self.connected = False # Ensure marked as disconnected
                          # Close the potentially partially connected socket before retry
@@ -879,20 +783,11 @@ class RSIMonitor:
         if self.is_running:
             logger.warning("Monitoring is already running.")
             return
-        
-        logger.info("Starting RSI Monitoring background tasks...")
-        self.is_running = True # Set flag early
-        self._stop_event.clear()
 
-        # Start the main WebSocket monitoring loop thread
+        # Run the main loop in a background thread
         self.monitor_thread = threading.Thread(target=self._run_monitoring_loop, daemon=True, name="RSIMonitorLoop")
         self.monitor_thread.start()
-        
-        # Start the auxiliary data fetching loop thread (for 1D RSI etc.)
-        self.aux_data_thread = threading.Thread(target=self._update_auxiliary_data_loop, daemon=True, name="AuxDataLoop")
-        self.aux_data_thread.start()
-
-        logger.info("RSI Monitoring background tasks started.")
+        logger.info("RSI Monitoring background task started.")
 
 
     def stop_monitoring(self):
@@ -902,28 +797,16 @@ class RSIMonitor:
             return
 
         logger.info("Stopping RSI monitoring...")
-        self._stop_event.set() # Signal ALL threads using this event to stop
-        self.is_running = False # Set flag
+        self.is_running = False
+        self._stop_event.set() # Signal threads to stop
 
         # Wait for threads to finish
-        if self.monitor_thread and self.monitor_thread.is_alive():
-             logger.info("Waiting for WebSocket monitoring loop thread to finish...")
+        if hasattr(self, 'monitor_thread') and self.monitor_thread.is_alive():
+             logger.info("Waiting for monitoring loop thread to finish...")
              self.monitor_thread.join(timeout=10) # Wait up to 10 seconds
              if self.monitor_thread.is_alive():
-                  logger.warning("WebSocket monitoring loop thread did not finish gracefully.")
-        
-        if self.aux_data_thread and self.aux_data_thread.is_alive():
-             logger.info("Waiting for auxiliary data fetching loop thread to finish...")
-             self.aux_data_thread.join(timeout=10) # Wait up to 10 seconds
-             if self.aux_data_thread.is_alive():
-                  logger.warning("Auxiliary data fetching loop thread did not finish gracefully.")
-        
-        # Heartbeat thread is daemon, should exit automatically if its loop checks _stop_event
-        # Ensure WebSocket is closed if monitor loop didn't handle it
-        if self.ws:
-            logger.info("Attempting final WebSocket closure...")
-            try: self.ws.exit()
-            except Exception as e: logger.warning(f"Exception during final WebSocket closure: {e}")
+                  logger.warning("Monitoring loop thread did not finish gracefully.")
+        # Heartbeat thread is daemon, should exit automatically
 
         logger.info("RSI Monitoring stopped.")
 
@@ -965,119 +848,97 @@ async def read_root():
     return {"message": "RSI Monitor Service running."}
 
 @app.get("/status")
-async def get_status(
-    interval: str = KLINE_INTERVAL, # Default to the primary WS interval (e.g., "240")
-    sort_by: str = "rsi", # "rsi" or "funding_rate"
-    limit: int = 5
-):
-    """Returns the current status, top/bottom symbols by RSI or Funding Rate."""
+async def get_status():
+    """Returns the current status of the RSI monitor."""
     if not monitor:
-        raise HTTPException(status_code=503, detail="Monitor not initialized.")
-    
-    # Validate parameters
-    valid_intervals = {KLINE_INTERVAL, "D", "60"} # Add "60" if 1H RSI is fetched by background task
-    if interval not in valid_intervals:
-         raise HTTPException(status_code=400, detail=f"Invalid interval. Valid options: {valid_intervals}")
-    if sort_by not in ["rsi", "funding_rate"]:
-        raise HTTPException(status_code=400, detail="Invalid sort_by. Valid options: 'rsi', 'funding_rate'")
-    if not (1 <= limit <= 20): # Set a reasonable limit range
-        raise HTTPException(status_code=400, detail="Invalid limit. Must be between 1 and 20.")
+        return {"status": "error", "message": "Monitor not initialized."}
 
-    all_data = []
     with monitor.lock:  # Use lock to safely access shared data
-        # Create a snapshot of symbols to iterate over
-        current_symbols = list(monitor.symbols)
+        rsi_count = len(monitor.rsi_values)
+        tracked_symbols = len(monitor.symbols)
+        subscribed_count = len(monitor.subscribed_symbols)
         
-        # Gather data from cache
-        for symbol in current_symbols:
-            symbol_data = monitor.rsi_values.get(symbol, {})
-            funding_rate = monitor.funding_rates.get(symbol)
-            
-            rsi_requested = symbol_data.get(interval) # RSI for the requested interval (e.g., 240 or D)
-            rsi_1d = symbol_data.get("D") # Always include 1D RSI
-            
-            # Determine primary value for sorting
-            primary_value = None
-            if sort_by == "rsi":
-                primary_value = rsi_requested
-            elif sort_by == "funding_rate":
-                primary_value = funding_rate
-            
-            # Only include symbols that have the primary value needed for sorting
-            if primary_value is not None and pd.notna(primary_value):
-                all_data.append({
-                    "symbol": symbol,
-                    "rsi_requested": rsi_requested, # The RSI value matching the interval param
-                    "rsi_1d": rsi_1d,
-                    "funding_rate": funding_rate,
-                    "primary_value": primary_value # Value used for sorting
-                })
-    
-    # Define sort key function
-    # Sort Nones last (ascending) or first (descending)
-    sort_reverse = True # Default: Higher RSI/Funding Rate is "top"
-    if sort_by == "rsi" and interval == "D":
-        # Optional: For Daily RSI, maybe lower is considered "better" for oversold
-        # sort_reverse = False # Uncomment if lower daily RSI should be top
-        pass
-    elif sort_by == "funding_rate":
-        # Higher funding rate (positive) is usually top for payers
-        # Lower funding rate (negative) is bottom for receivers
-        pass
+        # Calculate time since last message
+        time_since_last_msg = int(time.time() - monitor.last_message_time) if monitor.last_message_time else None
         
-    # Sort handling Nones: place them at the less desirable end
-    all_data.sort(
-        key=lambda x: (x['primary_value'] is None, x['primary_value']),
-        reverse=sort_reverse
-    )
-
-    # Select top and bottom N
-    top_n_raw = all_data[:limit]
-    bottom_n_raw = all_data[-limit:]
-
-    # Format results
-    def format_result(item):
-        rate = item['funding_rate']
-        # Use rsi_requested for the main "rsi" field in the response
-        rsi_value = item['rsi_requested'] 
-        # Always include the 1D RSI as 'daily_rsi'
-        daily_rsi_value = item['rsi_1d']
-        return {
-            "symbol": item['symbol'],
-            "rsi": round(rsi_value, 2) if rsi_value is not None and pd.notna(rsi_value) else None,
-            "daily_rsi": round(daily_rsi_value, 2) if daily_rsi_value is not None and pd.notna(daily_rsi_value) else None,
-            "funding_rate": rate,
-            "funding_rate_percent": f"{rate * 100:.4f}%" if rate is not None and pd.notna(rate) else None
-        }
-
-    results_top_n = [format_result(item) for item in top_n_raw]
-    results_bottom_n = [format_result(item) for item in bottom_n_raw]
-    
-    # --- Status Information --- (Also read under lock if possible, or accept minor race condition)
-    time_since_last_msg = int(time.time() - monitor.last_message_time) if monitor.last_message_time else None
-    websocket_status = "disconnected"
-    if monitor.connected:
-        if time_since_last_msg is not None and time_since_last_msg <= NO_MESSAGE_TIMEOUT:
-             websocket_status = "connected"
+        # More accurate connection status determination
+        if not monitor.connected:
+            websocket_status = "disconnected"
+        elif time_since_last_msg and time_since_last_msg > 30:
+            websocket_status = "stale"  # Connection exists but no recent messages
         else:
-             websocket_status = "stale" # Connected but no recent messages
-             
-    rsi_calculated_count = len(monitor.rsi_values) # Number of symbols with any RSI data
-    funding_rate_count = len(monitor.funding_rates)
+            websocket_status = "connected"  # Actively receiving messages
+        
+        # Get a snapshot of recent RSI values (e.g., top/bottom 5)
+        # Sort items safely, handle potential NaN or missing values
+        valid_rsi = {s: r for s, r in monitor.rsi_values.items() if pd.notna(r)}
+        sorted_rsi = sorted(valid_rsi.items(), key=lambda item: item[1], reverse=True)
+        top_5_rsi = sorted_rsi[:5]
+        bottom_5_rsi = sorted_rsi[-5:]
+
+        # Prepare results, fetch funding rates for top/bottom 5
+        results_top_5 = []
+        results_bottom_5 = []
+        symbols_to_check = {s for s, r in top_5_rsi} | {s for s, r in bottom_5_rsi}
+
+        # Fetch funding rates for the relevant symbols
+        funding_rates_snapshot = {}
+        for symbol in symbols_to_check:
+            rate = monitor._get_current_funding_rate(symbol)
+            if rate is not None:
+                monitor.funding_rates[symbol] = rate # Update shared cache
+                funding_rates_snapshot[symbol] = rate
+            # Use cached value if fetch fails but we have one
+            elif symbol in monitor.funding_rates:
+                 funding_rates_snapshot[symbol] = monitor.funding_rates[symbol]
+                 
+            # Small delay to avoid hitting rate limits aggressively if status is polled rapidly
+            time.sleep(0.05)
+
+        # Fetch daily RSI values for symbols
+        daily_rsi_values = {}
+        for symbol in symbols_to_check:
+            # Use "D" for daily interval
+            daily_rsi = monitor.get_rsi_for_interval(symbol, "D")
+            if daily_rsi is not None:
+                daily_rsi_values[symbol] = round(daily_rsi, 2)
+            time.sleep(0.1)  # Add delay to avoid rate limits
+
+        # Populate results with RSI, Daily RSI, and Funding Rate
+        for symbol, rsi in top_5_rsi:
+            rate = funding_rates_snapshot.get(symbol)
+            daily_rsi = daily_rsi_values.get(symbol)
+            results_top_5.append({
+                "symbol": symbol,
+                "rsi": round(rsi, 2) if pd.notna(rsi) else None,
+                "daily_rsi": daily_rsi,  # Add daily RSI value
+                "funding_rate": rate,
+                "funding_rate_percent": f"{rate * 100:.4f}%" if rate is not None else None
+            })
+
+        for symbol, rsi in bottom_5_rsi:
+            rate = funding_rates_snapshot.get(symbol)
+            daily_rsi = daily_rsi_values.get(symbol)
+            results_bottom_5.append({
+                "symbol": symbol,
+                "rsi": round(rsi, 2) if pd.notna(rsi) else None,
+                "daily_rsi": daily_rsi,  # Add daily RSI value
+                "funding_rate": rate,
+                "funding_rate_percent": f"{rate * 100:.4f}%" if rate is not None else None
+            })
+
 
     return {
         "status": "running" if monitor.is_running else "stopped",
         "websocket_status": websocket_status,
         "websocket_connected": monitor.connected,
         "last_message_time_ago_s": time_since_last_msg,
-        "tracked_symbol_count": len(monitor.symbols),
-        "subscribed_symbol_count": len(monitor.subscribed_symbols),
-        "rsi_data_count": rsi_calculated_count, # Renamed for clarity
-        "funding_rate_data_count": funding_rate_count,
+        "tracked_symbol_count": tracked_symbols,
+        "subscribed_symbol_count": subscribed_count,
+        "rsi_calculated_count": rsi_count,
         "reconnect_attempts": monitor.reconnect_count,
-        "params": {"sort_by": sort_by, "interval": interval, "limit": limit}, # Reflect params used
-        f"top_{limit}_{sort_by}": results_top_n,
-        f"bottom_{limit}_{sort_by}": results_bottom_n,
+        "top_5_rsi": results_top_5,
+        "bottom_5_rsi": results_bottom_5,
     }
 
 # Add other endpoints if needed, e.g., manually trigger history refresh, etc.
