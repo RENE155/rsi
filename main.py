@@ -507,7 +507,7 @@ class RSIMonitor:
                 
                 # Subscribe to Ticker Stream (for funding rate)
                 try:
-                    self.ws.tickers_stream(
+                    self.ws.ticker_stream(
                         symbol=symbol,
                         callback=handle_message_wrapper
                     )
@@ -650,9 +650,9 @@ class RSIMonitor:
                 return
 
             topic = message["topic"]
-            # Expected format: tickers.{symbol} (e.g., tickers.BTCUSDT)
+            # Expected format: publicTrade.{symbol} or ticker.{symbol} (e.g., ticker.BTCUSDT)
             parts = topic.split('.')
-            if len(parts) < 2 or parts[0] != 'tickers':
+            if len(parts) < 2:
                  logger.warning(f"Ignoring message with unexpected ticker topic format: {topic}")
                  return
             symbol = parts[1] 
